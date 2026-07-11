@@ -1,0 +1,417 @@
+# Criado por: marinaldosouza@gmail.com
+
+import os
+import urllib.request
+import shutil
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- Configurações globais do sistema e Checagem de Diretório ---
+try:
+    import winreg
+    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
+    desktop_path, _ = winreg.QueryValueEx(key, "Desktop")
+    winreg.CloseKey(key)
+    DESKTOP_PATH = Path(os.path.expandvars(desktop_path))
+except Exception:
+    DESKTOP_PATH = Path.home() / 'Desktop'
+
+# Cria a pasta de trabalho automaticamente caso não exista
+WORK_DIR = DESKTOP_PATH / 'Python_df'
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+# Definição dos caminhos dos arquivos
+FILE_URL = 'https://cdn3.gnarususercontent.com.br/2927-pandas-selecao-agrupamento-dados/1-SEEG10_GERAL-BR_UF_2022.10.27-FINAL-SITE.xlsx'
+EXCEL_FILE_PATH = WORK_DIR / 'SEEG10_GERAL-BR.xlsx'
+CSV_FILE_PATH = WORK_DIR / 'dados_transformados_melt.csv'
+TARGET_SHEET_NAME = 'GEE Estados'
+
+# --- Funções de Gerenciamento de Arquivos ---
+
+def verificar_e_atualizar_arquivos(excel_path: Path, csv_path: Path, url: str):
+    """
+    Checa se o Excel existe, faz download mascarando o User-Agent para evitar Erro 403,
+    e pergunta sobre atualização caso o arquivo já exista.
+    """
+    def baixar_arquivo(url_origem, caminho_destino):
+        # Disfarça o script Python como se fosse o navegador Google Chrome
+        req = urllib.request.Request(
+            url_origem,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        )
+        with urllib.request.urlopen(req) as response, open(caminho_destino, 'wb') as out_file:
+            shutil.copyfileobj(response, out_file)
+
+    if excel_path.exists():
+        resposta = input(f'\nO arquivo de dados já existe na pasta. Deseja atualizar baixando novamente? (S/N): ').strip().upper()
+        if resposta == 'S':
+            print(f'Iniciando download da versão mais recente (pode levar alguns instantes)...')
+            try:
+                baixar_arquivo(url, excel_path)
+                print('Download concluído com sucesso!')
+                
+                # Apaga o cache CSV antigo para forçar a leitura do novo Excel
+                if csv_path.exists():
+                    csv_path.unlink()
+                    print('Cache antigo removido. Os dados serão reprocessados.')
+            except Exception as e:
+                print(f'Falha ao tentar atualizar o arquivo: {e}')
+    else:
+        print(f'\nArquivo Excel não encontrado localmente.')
+        print(f'Iniciando download automático de: {url}')
+        print('Por favor, aguarde... (isso pode levar alguns instantes)')
+        try:
+            baixar_arquivo(url, excel_path)
+            print('Download concluído com sucesso!')
+        except Exception as e:
+            print(f'Falha crítica ao tentar baixar o arquivo: {e}')
+            print('Verifique sua conexão ou se o link ainda está ativo.')
+            raise
+
+def _load_excel_data(path: Path, sheet_name: str) -> pd.DataFrame:
+    print('\nCarregando dados do Excel para a memória...')
+    try:
+        return pd.read_excel(path, sheet_name=sheet_name, engine='openpyxl')
+    except Exception as e:
+        print(f'Erro ao carregar o Excel: {e}')
+        raise
+
+def _transform_dataframe_to_long_format(df: pd.DataFrame) -> pd.DataFrame:
+    print('Transformando dados (wide para long format)...')
+    year_columns = [col for col in df.columns if isinstance(col, int) or (isinstance(col, str) and str(col).isdigit())]
+    if not year_columns:
+        raise ValueError('Nenhuma coluna de ano detectada.')
+
+    id_vars = [
+        'Nível 1 - Setor', 'Nível 2', 'Nível 3', 'Nível 4', 'Nível 5', 'Nível 6',
+        'Emissão / Remoção / Bunker', 'Gás', 'Estado', 'Atividade Econômica', 'Produto'
+    ]
+    existing_id_vars = [col for col in id_vars if col in df.columns]
+
+    df_long = df.melt(
+        id_vars=existing_id_vars,
+        value_vars=year_columns,
+        var_name='Ano',
+        value_name='Emissões_Ano'
+    )
+    df_long['Ano'] = pd.to_numeric(df_long['Ano'], errors='coerce').astype('Int64')
+    df_long['Emissões_Ano'] = pd.to_numeric(df_long['Emissões_Ano'], errors='coerce')
+    return df_long
+
+def _select_and_clean_relevant_columns(df: pd.DataFrame) -> pd.DataFrame:
+    relevant_columns = [
+        'Nível 1 - Setor', 'Atividade Econômica', 'Gás', 'Ano', 'Emissões_Ano'
+    ]
+    df_clean = df[[col for col in relevant_columns if col in df.columns]].copy()
+
+    original_rows = len(df_clean)
+    df_clean = df_clean.dropna(subset=['Ano', 'Emissões_Ano', 'Nível 1 - Setor', 'Atividade Econômica', 'Gás'])
+
+    rows_removed = original_rows - len(df_clean)
+    if rows_removed > 0:
+        print(f'Removidas {rows_removed} linhas com valores nulos em colunas essenciais.')
+
+    if 'Nível 1 - Setor' in df_clean.columns:
+        df_clean['Nível 1 - Setor'] = df_clean['Nível 1 - Setor'].astype('category')
+    if 'Atividade Econômica' in df_clean.columns:
+        df_clean['Atividade Econômica'] = df_clean['Atividade Econômica'].astype('category')
+    if 'Gás' in df_clean.columns:
+        df_clean['Gás'] = df_clean['Gás'].astype('category')
+
+    return df_clean
+
+def load_or_process_data(excel_path: Path, sheet: str, csv_path: Path) -> pd.DataFrame:
+    if csv_path.exists():
+        try:
+            print(f'Tentando carregar dados do cache: {csv_path} (carregamento rápido)...')
+            
+            dtypes_map = {
+                'Nível 1 - Setor': 'category',
+                'Atividade Econômica': 'category',
+                'Gás': 'category'
+            }
+            df_global = pd.read_csv(csv_path, dtype=dtypes_map, engine='c')
+
+            df_global['Ano'] = pd.to_numeric(df_global['Ano'], errors='coerce').astype('Int64')
+            df_global['Emissões_Ano'] = pd.to_numeric(df_global['Emissões_Ano'], errors='coerce')
+
+            required_cols = ['Ano', 'Emissões_Ano', 'Nível 1 - Setor', 'Atividade Econômica', 'Gás']
+            original_rows = len(df_global)
+            df_global = df_global.dropna(subset=required_cols)
+            
+            if len(df_global) < original_rows:
+                print(f'Removidas {original_rows - len(df_global)} linhas com nulos essenciais no CSV carregado.')
+
+            print('Dados carregados com sucesso!')
+            return df_global
+        except Exception as e:
+            print(f'Erro ao carregar ou validar o CSV existente ({e}). Recarregando e transformando do Excel.')
+
+    print(f'Arquivo cache CSV não encontrado ou inválido. Iniciando pipeline a partir do Excel.')
+    df_excel = _load_excel_data(excel_path, sheet)
+    df_long = _transform_dataframe_to_long_format(df_excel)
+    df_final = _select_and_clean_relevant_columns(df_long)
+
+    try:
+        df_final.to_csv(csv_path, index=False)
+        print(f'Dados transformados e salvos com sucesso no cache: {csv_path}')
+    except IOError as e:
+        print(f'Erro de E/S ao tentar salvar o arquivo CSV: {e}')
+        raise
+
+    return df_final
+
+# --- Funções Auxiliares de UI e Seleção ---
+
+def get_unique_sorted_values(df: pd.DataFrame, column: str, display_name: str) -> list:
+    unique_values = sorted(df[column].dropna().unique().tolist())
+    if not unique_values:
+        print(f'Nenhum {display_name.lower()} disponível. Verifique os dados.')
+        return []
+
+    print(f'\n--- {display_name}s disponíveis ---')
+    for idx, val in enumerate(unique_values):
+        print(f'{idx}: {val}')
+    return unique_values
+
+def get_user_selection(available_values: list, prompt: str, allow_multiple: bool = True) -> list:
+    entrada = input(prompt).strip()
+    if not entrada:
+        return available_values if allow_multiple else []
+
+    try:
+        indices = [int(i.strip()) for i in entrada.split(',') if i.strip()]
+        selected_values = [available_values[i] for i in indices if 0 <= i < len(available_values)]
+
+        if not selected_values:
+            raise ValueError('Nenhum item válido selecionado.')
+        if not allow_multiple and len(selected_values) > 1:
+            raise ValueError('Apenas um item pode ser selecionado.')
+        return selected_values
+    except (ValueError, IndexError) as e:
+        print(f'Erro na seleção: {e}. Digite números válidos.')
+        return []
+
+def get_year_selection(available_years: list, prompt: str) -> list:
+    entrada = input(prompt).strip()
+    if not entrada:
+        return available_years
+
+    try:
+        selected_years = []
+        if ':' in entrada:
+            start_str, end_str = entrada.split(':')
+            start_val, end_val = int(start_str.strip()), int(end_str.strip())
+            
+            is_valid_index = (0 <= start_val < len(available_years) and 0 <= end_val < len(available_years) and start_val <= end_val)
+            min_year, max_year = min(available_years), max(available_years)
+            is_valid_literal = (min_year <= start_val <= max_year and min_year <= end_val <= max_year and start_val <= end_val)
+
+            if is_valid_index:
+                selected_years = [available_years[i] for i in range(start_val, end_val + 1)]
+            elif is_valid_literal:
+                selected_years = [year for year in available_years if start_val <= year <= end_val]
+            else:
+                print('Erro: Intervalo inválido.')
+                return []
+        else:
+            partes = [p.strip() for p in entrada.split(',') if p.strip()]
+            
+            potential_years = []
+            all_literal = True
+            for p in partes:
+                try: potential_years.append(int(p))
+                except ValueError: all_literal = False; break
+
+            if all_literal and all(y in available_years for y in potential_years):
+                selected_years = potential_years
+            else:
+                indices = [int(p) for p in partes if p.isdigit() and 0 <= int(p) < len(available_years)]
+                if not indices:
+                    print('Nenhum ano válido selecionado.')
+                    return []
+                selected_years = [available_years[i] for i in indices]
+
+        return selected_years
+    except Exception as e:
+        print(f'Erro na seleção de anos: {e}')
+        return []
+
+def display_paginated_dataframe(df_to_display: pd.DataFrame, sort_column: str = 'Emissões_Ano'):
+    total_rows = len(df_to_display)
+    if total_rows == 0:
+        print("Não há linhas para exibir após os filtros.")
+        return
+
+    while True:
+        try:
+            entrada = input(f'\nPressione ENTER para 100 linhas, digite N linhas, ou "inicio:fim": ').strip()
+            start_row, end_row = 0, total_rows
+
+            if not entrada:
+                end_row = min(100, total_rows)
+            elif ':' in entrada:
+                parts = entrada.split(':')
+                start_row = int(parts[0]) - 1 if parts[0] else 0
+                end_row = int(parts[1]) if parts[1] else total_rows
+            else:
+                end_row = min(int(entrada), total_rows)
+
+            if not (0 <= start_row < total_rows and start_row < end_row):
+                print('Intervalo inválido.')
+                continue
+
+            end_row = min(end_row, total_rows)
+            print(f'\n--- Exibindo linhas {start_row + 1} a {end_row} ---')
+            print(df_to_display.iloc[start_row:end_row])
+            break
+        except Exception as e:
+            print(f'Erro na paginação: {e}')
+
+def display_validity_stats(df: pd.DataFrame, column: str = 'Emissões_Ano'):
+    total, validos = len(df), df[column].notna().sum()
+    print(f'\n--- Estatísticas Base de Dados ---')
+    print(f'Pasta de Trabalho: {WORK_DIR}')
+    print(f'Total processado: {total} linhas | Válidas: {validos} | Descartadas (nulas): {total - validos}')
+
+def _get_filtered_dataframe(df: pd.DataFrame, filter_col: str, display_name: str, allow_multiple: bool = True):
+    available_values = get_unique_sorted_values(df, filter_col, display_name)
+    if not available_values: return None, []
+
+    chosen = get_user_selection(available_values, f'Digite os índices desejados ou ENTER para todos: ', allow_multiple)
+    if not chosen: return None, []
+    
+    return df[df[filter_col].isin(chosen)].copy(), chosen
+
+def _display_pivot_table(df_filtered: pd.DataFrame, index_cols: list, columns_col: str, values_col: str = 'Emissões_Ano'):
+    if df_filtered.empty:
+        print("Não há dados para gerar o resumo.")
+        return
+
+    try:
+        temp_df = df_filtered.copy()
+        if pd.api.types.is_categorical_dtype(temp_df[columns_col]):
+            temp_df[columns_col] = temp_df[columns_col].cat.remove_unused_categories()
+
+        pivot_df = temp_df.pivot_table(
+            index=index_cols, columns=columns_col, values=values_col,
+            aggfunc='sum', fill_value=0, observed=True
+        )
+
+        pivot_df_filtered = pivot_df.loc[(pivot_df != 0).any(axis=1)]
+
+        if pivot_df_filtered.empty:
+            print("Nenhum dado com emissões diferentes de zero encontrado.")
+            return
+
+        print('\n--- Tabela Resumo Cruzada ---')
+        with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', 1000):
+            print(pivot_df_filtered.to_string(float_format="{:,.2f}".format))
+
+    except Exception as e:
+        print(f'Erro ao gerar resumo: {e}')
+
+# --- Menus e Visualizações ---
+
+def visualizacao_geral(df: pd.DataFrame):
+    df_current, _ = _get_filtered_dataframe(df, 'Nível 1 - Setor', 'Setor')
+    if df_current is None: return
+    df_current, _ = _get_filtered_dataframe(df_current, 'Atividade Econômica', 'Atividade')
+    if df_current is None: return
+
+    df_current = df_current.dropna(subset=['Emissões_Ano'])
+    if df_current.empty: return
+
+    choice = input('\n(D)etalhes ou (R)esumo por Ano? ').strip().upper()
+    if choice == 'D':
+        display_paginated_dataframe(df_current.sort_values(by='Emissões_Ano', ascending=False))
+    elif choice == 'R':
+        anos = get_unique_sorted_values(df_current, 'Ano', 'Ano')
+        if not anos: return
+        anos_sel = get_year_selection(anos, 'Selecione os anos ou ENTER para todos: ')
+        if anos_sel:
+            _display_pivot_table(df_current[df_current['Ano'].isin(anos_sel)], ['Nível 1 - Setor', 'Atividade Econômica'], 'Ano')
+
+def consulta_detalhada(df: pd.DataFrame):
+    df_current = df.copy()
+    for col, name in [('Nível 1 - Setor', 'Setor'), ('Atividade Econômica', 'Atividade'), ('Gás', 'Gás')]:
+        df_current, _ = _get_filtered_dataframe(df_current, col, name)
+        if df_current is None: return
+
+    anos = get_unique_sorted_values(df_current, 'Ano', 'Ano')
+    anos_sel = get_year_selection(anos, 'Selecione os anos ou ENTER para todos: ')
+    if not anos_sel: return
+    
+    df_current = df_current[df_current['Ano'].isin(anos_sel)].dropna(subset=['Emissões_Ano'])
+    if df_current.empty: return
+
+    print('\n--- Estatísticas ---')
+    print(df_current['Emissões_Ano'].describe())
+
+    choice = input('\n(D)etalhes ou (R)esumo? ').strip().upper()
+    if choice == 'D':
+        display_paginated_dataframe(df_current.sort_values(by='Emissões_Ano', ascending=False))
+    elif choice == 'R':
+        pivot_choice = input('(A)no ou por (G)ás e Ano? ').strip().upper()
+        if pivot_choice == 'A':
+            _display_pivot_table(df_current, ['Nível 1 - Setor', 'Atividade Econômica', 'Gás'], 'Ano')
+        elif pivot_choice == 'G':
+            df_g = df_current[df_current['Emissões_Ano'] != 0]
+            _display_pivot_table(df_g, ['Nível 1 - Setor', 'Atividade Econômica', 'Ano'], 'Gás')
+
+def estatisticas_graficas(df: pd.DataFrame):
+    setores = get_unique_sorted_values(df, 'Nível 1 - Setor', 'Setor')
+    if not setores: return
+    
+    setor_sel = get_user_selection(setores, 'Digite o índice (APENAS UM): ', allow_multiple=False)
+    if not setor_sel: return
+
+    df_setor = df[(df['Nível 1 - Setor'] == setor_sel[0])].dropna(subset=['Emissões_Ano', 'Ano'])
+    if df_setor.empty: return
+
+    emissao = df_setor.groupby('Ano')['Emissões_Ano'].sum().reset_index().sort_values(by='Ano')
+    if emissao.empty: return
+
+    max_e, min_e, mean_e = emissao['Emissões_Ano'].max(), emissao['Emissões_Ano'].min(), emissao['Emissões_Ano'].mean()
+    y_max, y_min = emissao.loc[emissao['Emissões_Ano'].idxmax(), 'Ano'], emissao.loc[emissao['Emissões_Ano'].idxmin(), 'Ano']
+
+    plt.figure(figsize=(14, 7))
+    sns.lineplot(x='Ano', y='Emissões_Ano', data=emissao, marker='o', color='blue')
+    plt.plot(y_max, max_e, 'o', color='black', markersize=10, label=f'Pico: {max_e:.2f} ({y_max})')
+    plt.axhline(mean_e, color='orange', linestyle='--', label=f'Média: {mean_e:.2f}')
+    plt.plot(y_min, min_e, 'o', color='green', markersize=10, label=f'Mínimo: {min_e:.2f} ({y_min})')
+
+    plt.title(f'Evolução - Setor: {setor_sel[0]}')
+    plt.xticks(emissao['Ano'].unique(), rotation=45)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+def display_menu(df: pd.DataFrame):
+    while True:
+        print('\n====== MENU ======')
+        print('1 - Visualização Geral\n2 - Consulta Detalhada\n3 - Gráficos por Setor\n0 - Sair')
+        opcao = input('Opção: ').strip()
+        
+        if opcao == '1': visualizacao_geral(df)
+        elif opcao == '2': consulta_detalhada(df)
+        elif opcao == '3': estatisticas_graficas(df)
+        elif opcao == '0': break
+
+# --- Bloco Principal de Execução ---
+if __name__ == '__main__':
+    print('Inicializando sistema e checando dependências locais...')
+    try:
+        verificar_e_atualizar_arquivos(EXCEL_FILE_PATH, CSV_FILE_PATH, FILE_URL)
+        df_global = load_or_process_data(EXCEL_FILE_PATH, TARGET_SHEET_NAME, CSV_FILE_PATH)
+        
+        if df_global is not None:
+            display_validity_stats(df_global)
+            display_menu(df_global)
+            
+    except Exception as e:
+        print(f'Erro crítico que impediu a execução: {e}')
